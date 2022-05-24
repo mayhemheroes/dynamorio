@@ -1,0 +1,7 @@
+project: rnshah9/dynamorio
+target: dynamorio
+image: ghcr.io/rnshah9/playground:dynamorio
+
+cmds:
+  - cmd: /repo/build/clients/bin64/drdisas
+ #    filepath: test.c
