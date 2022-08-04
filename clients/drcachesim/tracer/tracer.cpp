@@ -89,12 +89,6 @@ drmemtrace_client_main(client_id_t id, int argc, const char *argv[]);
  */
 DR_DISALLOW_UNSAFE_STATIC
 
-#define NOTIFY(level, ...)                     \
-    do {                                       \
-        if (op_verbose.get_value() >= (level)) \
-            dr_fprintf(STDERR, __VA_ARGS__);   \
-    } while (0)
-
 // A clean exit via dr_exit_process() is not supported from init code, but
 // we do want to at least close the pipe file.
 #define FATAL(...)                       \
@@ -132,6 +126,7 @@ typedef struct {
     byte *seg_base;
     byte *buf_base;
     uint64 num_refs;
+    uint64 num_writeouts; /* Buffer writeout instances. */
     uint64 bytes_written;
     uint64 cur_window_instr_count;
     /* For offline traces */
@@ -161,6 +156,11 @@ typedef struct {
     byte *buf_lz4;
 #endif
     bool has_thread_header;
+    // The physaddr_t class is designed to be per-thread.
+    physaddr_t physaddr;
+    uint64 num_phys_markers;
+    byte *v2p_buf;
+    uint64 num_v2p_writeouts; /* v2p_buf writeout instances. */
 } per_thread_t;
 
 #define MAX_NUM_DELAY_INSTRS 32
@@ -190,11 +190,10 @@ static client_id_t client_id;
 static void *mutex;          /* for multithread support */
 static uint64 num_refs;      /* keep a global memory reference count */
 static uint64 num_refs_racy; /* racy global memory reference count */
+static uint64 num_writeouts;
+static uint64 num_v2p_writeouts;
+static uint64 num_phys_markers;
 static volatile bool exited_process;
-
-/* virtual to physical translation */
-static bool have_phys;
-static physaddr_t physaddr;
 
 static drmgr_priority_t pri_pre_bbdup = { sizeof(drmgr_priority_t),
                                           DRMGR_PRIORITY_NAME_MEMTRACE, NULL, NULL,
@@ -203,10 +202,12 @@ static drmgr_priority_t pri_pre_bbdup = { sizeof(drmgr_priority_t),
 /* Allocated TLS slot offsets */
 enum {
     MEMTRACE_TLS_OFFS_BUF_PTR,
-    /* XXX: we could make these dynamic to save slots when there's no -L0_filter. */
+    /* XXX: we could make these dynamic to save slots when there's no
+     *-L0I_filter or -L0D_filter.
+     */
     MEMTRACE_TLS_OFFS_DCACHE,
     MEMTRACE_TLS_OFFS_ICACHE,
-    /* The instruction count for -L0_filter. */
+    /* The instruction count for -L0I_filter. */
     MEMTRACE_TLS_OFFS_ICOUNT,
     /* The decrementing instruction count for -trace_after_instrs.
      * We could share with MEMTRACE_TLS_OFFS_ICOUNT if we cleared in each thread
@@ -459,7 +460,7 @@ static int
 append_unit_header(void *drcontext, byte *buf_ptr, thread_id_t tid, ptr_int_t window)
 {
     int size_added = instru->append_unit_header(buf_ptr, tid, window);
-    if (op_L0_filter.get_value()) {
+    if (op_L0I_filter.get_value()) {
         // Include the instruction count.
         // It might be useful to include the count with each miss as well, but
         // in experiments that adds non-trivial space and time overheads (as
@@ -848,11 +849,43 @@ create_buffer(per_thread_t *data)
     }
 }
 
+static size_t
+get_v2p_buffer_size()
+{
+    // The handoff interface requires we use dr_raw_mem_alloc and thus page alignment.
+    // The v2p buffer needs to hold at most enough physical,virtual marker pairs for one
+    // regular MAX_NUM_ENTRIES trace buffer; if it's smaller, we'll handle that by
+    // emitting multiple times.
+    //
+    // Currently we use one page which is 256 entries for 4K pages (assuming zero upper
+    // bits: so no vsyscall or >48-bit addresses; the upper 16 bits being set would
+    // require extra markers for each address) which is enough for a single buffer for
+    // most cases.
+    //
+    // XXX: For many-thread apps, and esp on machines with larger pages, this could
+    // use a lot of additional memory we don't need: consider for 64K pages and 10K
+    // threads that's 640MB!  We could use a smaller buffer when the handoff interface
+    // is not in effect, or change the interface to use a different free function.
+    return dr_page_size();
+}
+
+static void
+create_v2p_buffer(per_thread_t *data)
+{
+    data->v2p_buf = (byte *)dr_raw_mem_alloc(get_v2p_buffer_size(),
+                                             DR_MEMPROT_READ | DR_MEMPROT_WRITE, NULL);
+    /* For file_ops_func.handoff_buf we have to handle failure as OOM is not unlikely. */
+    if (data->v2p_buf == NULL) {
+        FATAL("Failed to allocate virtual-to-physical buffer.\n");
+    }
+}
+
 static bool
 is_ok_to_split_before(trace_type_t type)
 {
     return type_is_instr(type) || type == TRACE_TYPE_INSTR_MAYBE_FETCH ||
-        type == TRACE_TYPE_MARKER || type == TRACE_TYPE_THREAD_EXIT;
+        type == TRACE_TYPE_MARKER || type == TRACE_TYPE_THREAD_EXIT ||
+        op_L0I_filter.get_value();
 }
 
 static inline bool
@@ -869,13 +902,237 @@ is_bytes_written_beyond_trace_max(per_thread_t *data)
         data->bytes_written > op_max_trace_size.get_value();
 }
 
+static size_t
+add_buffer_header(void *drcontext, per_thread_t *data, byte *buf_base)
+{
+    size_t header_size = 0;
+    // For online we already wrote the thread header but for offline it is in
+    // the first buffer, so skip over it.
+    if (data->has_thread_header && op_offline.get_value())
+        header_size = data->init_header_size;
+    data->has_thread_header = false;
+    // The initial slots are left empty for the header, which we add here.
+    header_size +=
+        append_unit_header(drcontext, buf_base + header_size, dr_get_thread_id(drcontext),
+                           get_local_window(data));
+    return header_size;
+}
+
+static uint
+output_buffer(void *drcontext, per_thread_t *data, byte *buf_base, byte *buf_ptr,
+              size_t header_size)
+{
+    byte *pipe_start = buf_base;
+    byte *pipe_end = pipe_start;
+    if (!op_offline.get_value()) {
+        for (byte *mem_ref = buf_base + header_size; mem_ref < buf_ptr;
+             mem_ref += instru->sizeof_entry()) {
+            // Split up the buffer into multiple writes to ensure atomic pipe writes.
+            // We can only split before TRACE_TYPE_INSTR, assuming only a few data
+            // entries in between instr entries.
+            // XXX i#2638: if we want to support branch target analysis in online
+            // traces we'll need to not split after a branch: either split before
+            // it or one instr after.
+            if (is_ok_to_split_before(instru->get_entry_type(mem_ref))) {
+                pipe_end = mem_ref;
+                // We check the end of this entry + the max # of delay entries to
+                // avoid splitting an instr from its subsequent bundle entry.
+                // An alternative is to have the reader use per-thread state.
+                if ((mem_ref + (1 + MAX_NUM_DELAY_ENTRIES) * instru->sizeof_entry() -
+                     pipe_start) > ipc_pipe.get_atomic_write_size()) {
+                    DR_ASSERT(is_ok_to_split_before(
+                        instru->get_entry_type(pipe_start + header_size)));
+                    pipe_start = atomic_pipe_write(drcontext, pipe_start, pipe_end,
+                                                   get_local_window(data));
+                }
+            }
+        }
+        // Write the rest to pipe
+        // The last few entries (e.g., instr + refs) may exceed the atomic write size,
+        // so we may need two writes.
+        // XXX i#2638: if we want to support branch target analysis in online
+        // traces we'll need to not split after a branch by carrying a write-final
+        // branch forward to the next buffer.
+        if ((buf_ptr - pipe_start) > ipc_pipe.get_atomic_write_size()) {
+            DR_ASSERT(
+                is_ok_to_split_before(instru->get_entry_type(pipe_start + header_size)));
+            pipe_start = atomic_pipe_write(drcontext, pipe_start, pipe_end,
+                                           get_local_window(data));
+        }
+        if ((buf_ptr - pipe_start) > (ssize_t)buf_hdr_slots_size) {
+            DR_ASSERT(
+                is_ok_to_split_before(instru->get_entry_type(pipe_start + header_size)));
+            atomic_pipe_write(drcontext, pipe_start, buf_ptr, get_local_window(data));
+        }
+    } else {
+        write_trace_data(drcontext, pipe_start, buf_ptr, get_local_window(data));
+    }
+    auto span = buf_ptr - buf_base; // Include the header.
+    DR_ASSERT(span % instru->sizeof_entry() == 0);
+    uint current_num_refs = (uint)(span / instru->sizeof_entry());
+    data->num_refs += current_num_refs;
+    data->bytes_written += buf_ptr - pipe_start;
+    bool is_v2p = false;
+    if (buf_base >= data->v2p_buf && buf_base < data->v2p_buf + get_v2p_buffer_size())
+        is_v2p = true;
+    if (is_v2p)
+        ++data->num_v2p_writeouts;
+    else
+        ++data->num_writeouts;
+
+    if (file_ops_func.handoff_buf != NULL) {
+        // The owner of the handoff callback now owns the buffer, and we get a new one.
+        if (is_v2p)
+            create_v2p_buffer(data);
+        else
+            create_buffer(data);
+    }
+    return current_num_refs;
+}
+
+static byte *
+process_entry_for_physaddr(void *drcontext, per_thread_t *data, size_t header_size,
+                           byte *v2p_ptr, byte *mem_ref, addr_t virt, trace_type_t type,
+                           bool *emitted, size_t *skip)
+{
+    bool from_cache = false;
+    addr_t phys = 0;
+    bool success = data->physaddr.virtual2physical(drcontext, virt, &phys, &from_cache);
+    ASSERT(emitted != NULL && skip != NULL, "invalid input parameters");
+    NOTIFY(4, "%s: type=%2d virt=%p phys=%p\n", __FUNCTION__, type, virt, phys);
+    if (!success) {
+        // XXX i#1735: Unfortunately this happens; currently we use the virtual
+        // address and continue.
+        // Cases where xl8 fails include:
+        // - vsyscall/kernel page,
+        // - wild access (NULL or very large bogus address) by app
+        // - page is swapped out (unlikely since we're querying *after* the
+        //   the app just accessed, but could happen)
+        NOTIFY(1, "virtual2physical translation failure for type=%2d addr=%p\n", type,
+               virt);
+        phys = virt;
+    }
+    // We keep the main entries as virtual but add markers showing
+    // the corresponding physical.  We assume the mappings are static, allowing
+    // us to only emit one marker pair per new page seen (per thread to avoid
+    // locks).
+    // XXX: Add spot-checks of mapping changes via a separate option from
+    // -virt2phys_freq?
+    if (from_cache)
+        return v2p_ptr;
+    // We have something to emit.  Rather than a memmove to insert inside the
+    // main buffer, we have a separate buffer, as our pair of markers means we
+    // do not need precise placement next to the corresponding regular entry
+    // (which also avoids extra work in raw2trace, esp for delayed branches and
+    // other cases).
+    // The downside is that we might have many buffers with a small number
+    // of markers on which we waste buffer output overhead.
+    // XXX: We could count them up and do a memmove if the count is small
+    // and we have space in the redzone?
+    if (!*emitted) {
+        // We need to be sure to emit the initial thread header if this is before
+        // the first regular buffer and skip it in the regular buffer.
+        if (header_size > buf_hdr_slots_size) {
+            size_t size =
+                reinterpret_cast<offline_instru_t *>(instru)->append_thread_header(
+                    data->v2p_buf, dr_get_thread_id(drcontext), get_file_type());
+            ASSERT(size == data->init_header_size, "inconsistent header");
+            *skip = data->init_header_size;
+            v2p_ptr += size;
+            header_size += size;
+        }
+        v2p_ptr += add_buffer_header(drcontext, data, v2p_ptr);
+        *emitted = true;
+    }
+    if (v2p_ptr + 2 * instru->sizeof_entry() - data->v2p_buf >=
+        static_cast<ssize_t>(get_v2p_buffer_size())) {
+        NOTIFY(1, "Reached v2p buffer limit: emitting multiple times\n");
+        data->num_phys_markers +=
+            output_buffer(drcontext, data, data->v2p_buf, v2p_ptr, header_size);
+        v2p_ptr = data->v2p_buf;
+        v2p_ptr += add_buffer_header(drcontext, data, v2p_ptr);
+    }
+    if (success) {
+        v2p_ptr +=
+            instru->append_marker(v2p_ptr, TRACE_MARKER_TYPE_PHYSICAL_ADDRESS, phys);
+        v2p_ptr +=
+            instru->append_marker(v2p_ptr, TRACE_MARKER_TYPE_VIRTUAL_ADDRESS, virt);
+    } else {
+        // For translation failure, we insert a distinct marker type, so analyzers
+        // know for sure and don't have to infer based on a missing marker.
+        v2p_ptr += instru->append_marker(
+            v2p_ptr, TRACE_MARKER_TYPE_PHYSICAL_ADDRESS_NOT_AVAILABLE, virt);
+    }
+    return v2p_ptr;
+}
+
+// Should be called only for -use_physical.
+// Returns the byte count to skip in the trace buffer (due to shifting some headers
+// to the v2p buffer).
+static size_t
+process_buffer_for_physaddr(void *drcontext, per_thread_t *data, size_t header_size,
+                            byte *buf_ptr)
+{
+    ASSERT(op_use_physical.get_value(),
+           "Caller must check for use_physical being enabled");
+    byte *v2p_ptr = data->v2p_buf;
+    size_t skip = 0;
+    bool emitted = false;
+    for (byte *mem_ref = data->buf_base + header_size; mem_ref < buf_ptr;
+         mem_ref += instru->sizeof_entry()) {
+        trace_type_t type = instru->get_entry_type(mem_ref);
+        DR_ASSERT(type != TRACE_TYPE_INSTR_BUNDLE); // Bundles disabled up front.
+        if (!type_has_address(type))
+            continue;
+        addr_t virt = instru->get_entry_addr(drcontext, mem_ref);
+        v2p_ptr = process_entry_for_physaddr(drcontext, data, header_size, v2p_ptr,
+                                             mem_ref, virt, type, &emitted, &skip);
+        // Handle the memory reference crossing onto a second page.
+        size_t page_size = dr_page_size();
+        addr_t virt_page = ALIGN_BACKWARD(virt, page_size);
+        size_t mem_ref_size = instru->get_entry_size(mem_ref);
+        if (type_is_instr(type) || type == TRACE_TYPE_INSTR_NO_FETCH ||
+            type == TRACE_TYPE_INSTR_MAYBE_FETCH) {
+            int instr_count = instru->get_instr_count(mem_ref);
+            if (op_offline.get_value()) {
+                // We do not have the size so we have to guess.  It is ok to emit an
+                // unused translation so we err on the side of caution.  We do not use
+                // the maximum possible instruction sizes since for x86 that's 17 * 256
+                // (max_bb_instrs) that's >4096.  The average x86 instr length is <4 but
+                // we use 8 to be conservative while not as extreme as 17 which will
+                // lead to too many unused markers.
+                static constexpr size_t PREDICT_INSTR_SIZE_BOUND = IF_X86_ELSE(8, 4);
+                mem_ref_size = instr_count * PREDICT_INSTR_SIZE_BOUND;
+            } else
+                ASSERT(instr_count <= 1, "bundles are disabled");
+        } else if (op_offline.get_value()) {
+            // For data, we again do not have the size.
+            static constexpr size_t PREDICT_DATA_SIZE_BOUND = sizeof(void *);
+            mem_ref_size = PREDICT_DATA_SIZE_BOUND;
+        }
+        if (ALIGN_BACKWARD(virt + mem_ref_size - 1 /*open-ended*/, page_size) !=
+            virt_page) {
+            NOTIFY(2, "Emitting physaddr for next page %p for type=%2d, addr=%p\n",
+                   virt_page + page_size, type, virt);
+            v2p_ptr =
+                process_entry_for_physaddr(drcontext, data, header_size, v2p_ptr, mem_ref,
+                                           virt_page + page_size, type, &emitted, &skip);
+        }
+    }
+    if (emitted) {
+        data->num_phys_markers +=
+            output_buffer(drcontext, data, data->v2p_buf, v2p_ptr, header_size);
+    }
+    return skip;
+}
+
 // Should be invoked only in the middle of an active tracing window.
 static void
 memtrace(void *drcontext, bool skip_size_cap)
 {
     per_thread_t *data = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
     byte *mem_ref, *buf_ptr;
-    byte *pipe_start, *pipe_end, *redzone;
+    byte *redzone;
     bool do_write = true;
     size_t header_size = 0;
     uint current_num_refs = 0;
@@ -887,11 +1144,8 @@ memtrace(void *drcontext, bool skip_size_cap)
     }
 
     buf_ptr = BUF_PTR(data->seg_base);
-    // For online we already wrote the thread header but for offline it is in
-    // the first buffer, so skip over it.
-    if (data->has_thread_header && op_offline.get_value())
-        header_size = data->init_header_size;
-    // We may get called with nothing to write: e.g., on a syscall for -L0_filter.
+    // We may get called with nothing to write: e.g., on a syscall for
+    // -L0I_filter and -L0D_filter.
     if (buf_ptr == data->buf_base + header_size + buf_hdr_slots_size) {
         if (has_tracing_windows()) {
             // If there is no data to write, we do not emit an empty header here
@@ -902,11 +1156,9 @@ memtrace(void *drcontext, bool skip_size_cap)
         }
         return;
     }
-    data->has_thread_header = false;
-    // The initial slots are left empty for the header, which we add here.
-    header_size +=
-        append_unit_header(drcontext, data->buf_base + header_size,
-                           dr_get_thread_id(drcontext), get_local_window(data));
+
+    header_size = add_buffer_header(drcontext, data, data->buf_base);
+
     bool window_changed = false;
     if (has_tracing_windows() &&
         get_local_window(data) != tracing_window.load(std::memory_order_acquire)) {
@@ -921,8 +1173,6 @@ memtrace(void *drcontext, bool skip_size_cap)
         if (op_offline.get_value() && op_split_windows.get_value())
             buf_ptr += instru->append_thread_exit(buf_ptr, dr_get_thread_id(drcontext));
     }
-    pipe_start = data->buf_base;
-    pipe_end = pipe_start;
     if (!skip_size_cap &&
         (is_bytes_written_beyond_trace_max(data) || is_num_refs_beyond_global_max())) {
         /* We don't guarantee to match the limit exactly so we allow one buffer
@@ -949,13 +1199,11 @@ memtrace(void *drcontext, bool skip_size_cap)
                 }
             }
         }
-    } else
-        data->bytes_written += buf_ptr - pipe_start;
+    }
 
     if (do_write) {
         bool hit_window_end = false;
-        if ((have_phys && op_use_physical.get_value()) ||
-            op_trace_for_instrs.get_value() > 0) {
+        if (op_trace_for_instrs.get_value() > 0) {
             for (mem_ref = data->buf_base + header_size; mem_ref < buf_ptr;
                  mem_ref += instru->sizeof_entry()) {
                 if (!window_changed && !hit_window_end &&
@@ -969,32 +1217,11 @@ memtrace(void *drcontext, bool skip_size_cap)
                     // Should we discard the rest of the entries in such a case, at
                     // a block boundary, even though we already collected them?
                 }
-                trace_type_t type = instru->get_entry_type(mem_ref);
-                if (have_phys && op_use_physical.get_value() &&
-                    type != TRACE_TYPE_THREAD && type != TRACE_TYPE_THREAD_EXIT &&
-                    type != TRACE_TYPE_PID) {
-                    addr_t virt = instru->get_entry_addr(mem_ref);
-                    addr_t phys = physaddr.virtual2physical(virt);
-                    DR_ASSERT(type != TRACE_TYPE_INSTR_BUNDLE);
-                    if (phys != 0)
-                        instru->set_entry_addr(mem_ref, phys);
-                    else {
-                        // XXX i#1735: use virtual address and continue?
-                        // There are cases the xl8 fail, e.g.,:
-                        // - vsyscall/kernel page,
-                        // - wild access (NULL or very large bogus address) by app
-                        NOTIFY(1,
-                               "virtual2physical translation failure for "
-                               "<%2d, %2d, " PFX ">\n",
-                               type, instru->get_entry_size(mem_ref), virt);
-                    }
-                }
             }
             if (hit_window_end) {
                 if (op_offline.get_value() && op_split_windows.get_value()) {
                     size_t add =
                         instru->append_thread_exit(buf_ptr, dr_get_thread_id(drcontext));
-                    data->bytes_written += add;
                     buf_ptr += add;
                 }
                 // Update the global window, but not the local so we can place the rest
@@ -1002,59 +1229,15 @@ memtrace(void *drcontext, bool skip_size_cap)
                 reached_traced_instrs_threshold(drcontext);
             }
         }
-        if (!op_offline.get_value()) {
-            for (mem_ref = data->buf_base + header_size; mem_ref < buf_ptr;
-                 mem_ref += instru->sizeof_entry()) {
-                // Split up the buffer into multiple writes to ensure atomic pipe writes.
-                // We can only split before TRACE_TYPE_INSTR, assuming only a few data
-                // entries in between instr entries.
-                // XXX i#2638: if we want to support branch target analysis in online
-                // traces we'll need to not split after a branch: either split before
-                // it or one instr after.
-                if (is_ok_to_split_before(instru->get_entry_type(mem_ref))) {
-                    pipe_end = mem_ref;
-                    // We check the end of this entry + the max # of delay entries to
-                    // avoid splitting an instr from its subsequent bundle entry.
-                    // An alternative is to have the reader use per-thread state.
-                    if ((mem_ref + (1 + MAX_NUM_DELAY_ENTRIES) * instru->sizeof_entry() -
-                         pipe_start) > ipc_pipe.get_atomic_write_size()) {
-                        DR_ASSERT(is_ok_to_split_before(
-                            instru->get_entry_type(pipe_start + header_size)));
-                        pipe_start = atomic_pipe_write(drcontext, pipe_start, pipe_end,
-                                                       get_local_window(data));
-                    }
-                }
-            }
-            // Write the rest to pipe
-            // The last few entries (e.g., instr + refs) may exceed the atomic write size,
-            // so we may need two writes.
-            // XXX i#2638: if we want to support branch target analysis in online
-            // traces we'll need to not split after a branch by carrying a write-final
-            // branch forward to the next buffer.
-            if ((buf_ptr - pipe_start) > ipc_pipe.get_atomic_write_size()) {
-                DR_ASSERT(is_ok_to_split_before(
-                    instru->get_entry_type(pipe_start + header_size)));
-                pipe_start = atomic_pipe_write(drcontext, pipe_start, pipe_end,
-                                               get_local_window(data));
-            }
-            if ((buf_ptr - pipe_start) > (ssize_t)buf_hdr_slots_size) {
-                DR_ASSERT(is_ok_to_split_before(
-                    instru->get_entry_type(pipe_start + header_size)));
-                atomic_pipe_write(drcontext, pipe_start, buf_ptr, get_local_window(data));
-            }
-        } else {
-            write_trace_data(drcontext, pipe_start, buf_ptr, get_local_window(data));
+        size_t skip = 0;
+        if (op_use_physical.get_value()) {
+            skip = process_buffer_for_physaddr(drcontext, data, header_size, buf_ptr);
         }
-        auto span = buf_ptr - (data->buf_base + header_size);
-        DR_ASSERT(span % instru->sizeof_entry() == 0);
-        current_num_refs = (uint)(span / instru->sizeof_entry());
-        data->num_refs += current_num_refs;
+        current_num_refs +=
+            output_buffer(drcontext, data, data->buf_base + skip, buf_ptr, header_size);
     }
 
-    if (do_write && file_ops_func.handoff_buf != NULL) {
-        // The owner of the handoff callback now owns the buffer, and we get a new one.
-        create_buffer(data);
-    } else {
+    if (file_ops_func.handoff_buf == NULL) {
         // Our instrumentation reads from buffer and skips the clean call if the
         // content is 0, so we need set zero in the trace buffer and set non-zero
         // in redzone.
@@ -1389,7 +1572,8 @@ insert_update_buf_ptr(void *drcontext, instrlist_t *ilist, instr_t *where,
 {
     if (adjust == 0)
         return;
-    if (!op_L0_filter.get_value()) // Filter skips over this for !pred.
+    if (!(op_L0I_filter.get_value() ||
+          op_L0D_filter.get_value())) // Filter skips over this for !pred.
         instrlist_set_auto_predicate(ilist, pred);
     MINSERT(
         ilist, where,
@@ -1406,7 +1590,7 @@ instrument_delay_instrs(void *drcontext, void *tag, instrlist_t *ilist, user_dat
     // Instrument to add a full instr entry for the first instr.
     adjust = instru->instrument_instr(drcontext, tag, &ud->instru_field, ilist, where,
                                       reg_ptr, adjust, ud->delay_instrs[0]);
-    if (have_phys && op_use_physical.get_value()) {
+    if (op_use_physical.get_value()) {
         // No instr bundle if physical-2-virtual since instr bundle may
         // cross page bundary.
         int i;
@@ -1613,6 +1797,9 @@ instrument_clean_call(void *drcontext, instrlist_t *ilist, instr_t *where,
         MINSERT(ilist, where,
                 XINST_CREATE_sub(drcontext, opnd_create_reg(reg_mine),
                                  opnd_create_reg(reg_global)));
+#elif defined(RISCV64)
+        /* FIXME i#3544: Not implemented */
+        DR_ASSERT_MSG(false, "Not implemented on RISC-V");
 #else
         // Our version of a flags-free reg-reg subtraction: 1's complement one reg
         // plus 1 and then add using base+index of LEA.
@@ -1646,7 +1833,8 @@ instrument_clean_call(void *drcontext, instrlist_t *ilist, instr_t *where,
     reg_id_t reg_tmp = DR_REG_NULL;
     instr_t *skip_thread = INSTR_CREATE_label(drcontext);
     reg_id_set_t app_regs_at_skip_thread;
-    if (op_L0_filter.get_value() && thread_filtering_enabled) {
+    if ((op_L0I_filter.get_value() || op_L0D_filter.get_value()) &&
+        thread_filtering_enabled) {
         insert_conditional_skip(drcontext, ilist, where, reg_ptr, &reg_tmp, skip_thread,
                                 short_reaches, app_regs_at_skip_thread);
     }
@@ -1678,7 +1866,7 @@ insert_filter_addr(void *drcontext, instrlist_t *ilist, instr_t *where, user_dat
                    dr_pred_type_t pred)
 {
     // Our "level 0" inlined direct-mapped cache filter.
-    DR_ASSERT(op_L0_filter.get_value());
+    DR_ASSERT(op_L0I_filter.get_value() || op_L0D_filter.get_value());
     reg_id_t reg_idx;
     bool is_icache = opnd_is_null(ref);
     uint64 cache_size = is_icache ? op_L0I_size.get_value() : op_L0D_size.get_value();
@@ -1812,7 +2000,7 @@ instrument_memref(void *drcontext, user_data_t *ud, instrlist_t *ilist, instr_t 
     }
     instr_t *skip = INSTR_CREATE_label(drcontext);
     reg_id_t reg_third = DR_REG_NULL;
-    if (op_L0_filter.get_value()) {
+    if (op_L0D_filter.get_value()) {
         reg_third = insert_filter_addr(drcontext, ilist, where, ud, reg_ptr, ref, NULL,
                                        skip, pred);
         if (reg_third == DR_REG_NULL) {
@@ -1820,17 +2008,20 @@ instrument_memref(void *drcontext, user_data_t *ud, instrlist_t *ilist, instr_t 
             return adjust;
         }
     }
-    if (op_L0_filter.get_value())
+    // XXX: If we're filtering only instrs, not data, then we can possibly
+    // avoid loading the buf ptr for each memref. We skip this optimization for
+    // now for simplicity.
+    if (op_L0I_filter.get_value() || op_L0D_filter.get_value())
         insert_load_buf_ptr(drcontext, ilist, where, reg_ptr);
     adjust = instru->instrument_memref(drcontext, ilist, where, reg_ptr, adjust, app, ref,
                                        ref_index, write, pred);
-    if (op_L0_filter.get_value() && adjust != 0) {
+    if ((op_L0I_filter.get_value() || op_L0D_filter.get_value()) && adjust != 0) {
         // When filtering we can't combine buf_ptr adjustments.
         insert_update_buf_ptr(drcontext, ilist, where, reg_ptr, pred, adjust);
         adjust = 0;
     }
     MINSERT(ilist, where, skip);
-    if (op_L0_filter.get_value()) {
+    if (op_L0D_filter.get_value()) {
         // drreg requires parity on all paths, so we need to restore the scratch regs
         // for the filter *after* the skip target.
         if (reg_third != DR_REG_NULL &&
@@ -1848,7 +2039,7 @@ instrument_instr(void *drcontext, void *tag, user_data_t *ud, instrlist_t *ilist
 {
     instr_t *skip = INSTR_CREATE_label(drcontext);
     reg_id_t reg_third = DR_REG_NULL;
-    if (op_L0_filter.get_value()) {
+    if (op_L0I_filter.get_value()) {
         // Count dynamic instructions per thread.
         // It is too expensive to increment per instruction, so we increment once
         // per block by the instruction count for that block.
@@ -1874,17 +2065,17 @@ instrument_instr(void *drcontext, void *tag, user_data_t *ud, instrlist_t *ilist
             return adjust;
         }
     }
-    if (op_L0_filter.get_value()) // Else already loaded.
+    if (op_L0I_filter.get_value() || op_L0D_filter.get_value()) // Else already loaded.
         insert_load_buf_ptr(drcontext, ilist, where, reg_ptr);
     adjust = instru->instrument_instr(drcontext, tag, &ud->instru_field, ilist, where,
                                       reg_ptr, adjust, app);
-    if (op_L0_filter.get_value() && adjust != 0) {
+    if ((op_L0I_filter.get_value() || op_L0D_filter.get_value()) && adjust != 0) {
         // When filtering we can't combine buf_ptr adjustments.
         insert_update_buf_ptr(drcontext, ilist, where, reg_ptr, DR_PRED_NONE, adjust);
         adjust = 0;
     }
     MINSERT(ilist, where, skip);
-    if (op_L0_filter.get_value()) {
+    if (op_L0I_filter.get_value()) {
         // drreg requires parity on all paths, so we need to restore the scratch regs
         // for the filter *after* the skip target.
         if (reg_third != DR_REG_NULL &&
@@ -1928,7 +2119,8 @@ event_app_instruction(void *drcontext, void *tag, instrlist_t *bb, instr_t *inst
 
     drmgr_disable_auto_predication(drcontext, bb);
 
-    if (op_L0_filter.get_value() && ud->repstr && is_first_nonlabel(drcontext, instr)) {
+    if ((op_L0I_filter.get_value() || op_L0D_filter.get_value()) && ud->repstr &&
+        is_first_nonlabel(drcontext, instr)) {
         // XXX: the control flow added for repstr ends up jumping over the
         // aflags spill for the memref, yet it hits the lazily-delayed aflags
         // restore.  We don't have a great solution (repstr violates drreg's
@@ -2005,7 +2197,7 @@ event_app_instruction(void *drcontext, void *tag, instrlist_t *bb, instr_t *inst
         // flow and other complications that could cause us to skip an instruction.
         !drmgr_in_emulation_region(drcontext, NULL) &&
         // We can't bundle with a filter.
-        !op_L0_filter.get_value() &&
+        !(op_L0I_filter.get_value() || op_L0D_filter.get_value()) &&
         // The delay instr buffer is not full.
         ud->num_delay_instrs < MAX_NUM_DELAY_INSTRS) {
         ud->delay_instrs[ud->num_delay_instrs++] = instr_fetch;
@@ -2019,6 +2211,9 @@ event_app_instruction(void *drcontext, void *tag, instrlist_t *bb, instr_t *inst
     drreg_init_and_fill_vector(&rvec, false);
 #ifdef X86
     drreg_set_vector_entry(&rvec, DR_REG_XCX, true);
+#elif defined(RISCV64)
+    /* FIXME i#3544: Check if scratch reg can be used here. */
+    drreg_set_vector_entry(&rvec, DR_REG_T2, true);
 #else
     for (reg_ptr = DR_REG_R0; reg_ptr <= DR_REG_R7; reg_ptr++)
         drreg_set_vector_entry(&rvec, reg_ptr, true);
@@ -2033,7 +2228,7 @@ event_app_instruction(void *drcontext, void *tag, instrlist_t *bb, instr_t *inst
     instr_t *skip_instru = INSTR_CREATE_label(drcontext);
     reg_id_t reg_skip = DR_REG_NULL;
     reg_id_set_t app_regs_at_skip;
-    if (!op_L0_filter.get_value()) {
+    if (!(op_L0I_filter.get_value() || op_L0D_filter.get_value())) {
         insert_load_buf_ptr(drcontext, bb, where, reg_ptr);
         if (thread_filtering_enabled) {
             bool short_reaches = false;
@@ -2109,7 +2304,7 @@ event_app_instruction(void *drcontext, void *tag, instrlist_t *bb, instr_t *inst
      * assuming the clean call does not need the two register values.
      */
     if (is_last_instr(drcontext, instr)) {
-        if (op_L0_filter.get_value())
+        if (op_L0I_filter.get_value() || op_L0D_filter.get_value())
             insert_load_buf_ptr(drcontext, bb, where, reg_ptr);
         instrument_clean_call(drcontext, bb, where, reg_ptr);
     }
@@ -2562,15 +2757,22 @@ event_inscount_app_instruction(void *drcontext, void *tag, instrlist_t *bb,
 static offline_file_type_t
 get_file_type()
 {
-    offline_file_type_t file_type =
-        op_L0_filter.get_value() ? OFFLINE_FILE_TYPE_FILTERED : OFFLINE_FILE_TYPE_DEFAULT;
+    offline_file_type_t file_type = OFFLINE_FILE_TYPE_DEFAULT;
+    if (op_L0I_filter.get_value()) {
+        file_type =
+            static_cast<offline_file_type_t>(file_type | OFFLINE_FILE_TYPE_IFILTERED);
+    }
+    if (op_L0D_filter.get_value()) {
+        file_type =
+            static_cast<offline_file_type_t>(file_type | OFFLINE_FILE_TYPE_DFILTERED);
+    }
     if (op_disable_optimizations.get_value()) {
         file_type = static_cast<offline_file_type_t>(file_type |
                                                      OFFLINE_FILE_TYPE_NO_OPTIMIZATIONS);
     }
     if (op_instr_only_trace.get_value() ||
-        // Data entries are removed from trace if -L0_filter and -L0D_size 0
-        (op_L0_filter.get_value() && op_L0D_size.get_value() == 0)) {
+        // Data entries are removed from trace if -L0D_filter and -L0D_size 0
+        (op_L0D_filter.get_value() && op_L0D_size.get_value() == 0)) {
         file_type = static_cast<offline_file_type_t>(file_type |
                                                      OFFLINE_FILE_TYPE_INSTRUCTION_ONLY);
     }
@@ -2608,6 +2810,14 @@ init_thread_in_process(void *drcontext)
     }
 #endif
 
+    if (op_use_physical.get_value()) {
+        if (!data->physaddr.init()) {
+            FATAL("Unable to open pagemap for physical addresses in thread T%d: check "
+                  "privileges.\n",
+                  dr_get_thread_id(drcontext));
+        }
+    }
+
     set_local_window(drcontext, -1);
     if (has_tracing_windows())
         set_local_window(drcontext, tracing_window.load(std::memory_order_acquire));
@@ -2635,23 +2845,17 @@ init_thread_in_process(void *drcontext)
         BUF_PTR(data->seg_base) = data->buf_base + buf_hdr_slots_size;
     }
 
-    if (op_L0_filter.get_value()) {
-        if (op_L0D_size.get_value() > 0) {
-            data->l0_dcache =
-                (byte *)dr_raw_mem_alloc((size_t)op_L0D_size.get_value() /
-                                             op_line_size.get_value() * sizeof(void *),
-                                         DR_MEMPROT_READ | DR_MEMPROT_WRITE, NULL);
-            *(byte **)TLS_SLOT(data->seg_base, MEMTRACE_TLS_OFFS_DCACHE) =
-                data->l0_dcache;
-        }
-        if (op_L0I_size.get_value() > 0) {
-            data->l0_icache =
-                (byte *)dr_raw_mem_alloc((size_t)op_L0I_size.get_value() /
-                                             op_line_size.get_value() * sizeof(void *),
-                                         DR_MEMPROT_READ | DR_MEMPROT_WRITE, NULL);
-            *(byte **)TLS_SLOT(data->seg_base, MEMTRACE_TLS_OFFS_ICACHE) =
-                data->l0_icache;
-        }
+    if (op_L0D_filter.get_value() && op_L0D_size.get_value() > 0) {
+        data->l0_dcache = (byte *)dr_raw_mem_alloc(
+            (size_t)op_L0D_size.get_value() / op_line_size.get_value() * sizeof(void *),
+            DR_MEMPROT_READ | DR_MEMPROT_WRITE, NULL);
+        *(byte **)TLS_SLOT(data->seg_base, MEMTRACE_TLS_OFFS_DCACHE) = data->l0_dcache;
+    }
+    if (op_L0I_filter.get_value() && op_L0I_size.get_value() > 0) {
+        data->l0_icache = (byte *)dr_raw_mem_alloc(
+            (size_t)op_L0I_size.get_value() / op_line_size.get_value() * sizeof(void *),
+            DR_MEMPROT_READ | DR_MEMPROT_WRITE, NULL);
+        *(byte **)TLS_SLOT(data->seg_base, MEMTRACE_TLS_OFFS_ICACHE) = data->l0_icache;
     }
 
     // XXX i#1729: gather and store an initial callstack for the thread.
@@ -2662,7 +2866,7 @@ event_thread_init(void *drcontext)
 {
     per_thread_t *data = (per_thread_t *)dr_thread_alloc(drcontext, sizeof(per_thread_t));
     DR_ASSERT(data != NULL);
-    memset(data, 0, sizeof(*data));
+    *data = {}; // We must safely zero due to the C++ class member.
     data->file = INVALID_FILE;
     drmgr_set_tls_field(drcontext, tls_idx, data);
 
@@ -2682,6 +2886,9 @@ event_thread_init(void *drcontext)
         BUF_PTR(data->seg_base) = NULL;
     else {
         create_buffer(data);
+        if (op_use_physical.get_value()) {
+            create_v2p_buffer(data);
+        }
         init_thread_in_process(drcontext);
         // XXX i#1729: gather and store an initial callstack for the thread.
     }
@@ -2700,7 +2907,7 @@ event_thread_exit(void *drcontext)
             // If over the limit, we still want to write the footer, but nothing else.
             BUF_PTR(data->seg_base) = data->buf_base + buf_hdr_slots_size;
         }
-        if (op_L0_filter.get_value()) {
+        if (op_L0I_filter.get_value()) {
             // Include the final instruction count.
             // It might be useful to include the count with each miss as well, but
             // in experiments that adds non-trivial space and time overheads (as
@@ -2732,12 +2939,14 @@ event_thread_exit(void *drcontext)
             }
         }
 
-        if (op_L0_filter.get_value()) {
+        if (op_L0D_filter.get_value()) {
             if (op_L0D_size.get_value() > 0) {
                 dr_raw_mem_free(data->l0_dcache,
                                 (size_t)op_L0D_size.get_value() /
                                     op_line_size.get_value() * sizeof(void *));
             }
+        }
+        if (op_L0I_filter.get_value()) {
             if (op_L0I_size.get_value() > 0) {
                 dr_raw_mem_free(data->l0_icache,
                                 (size_t)op_L0I_size.get_value() /
@@ -2763,11 +2972,15 @@ event_thread_exit(void *drcontext)
 
         dr_mutex_lock(mutex);
         num_refs += data->num_refs;
+        num_writeouts += data->num_writeouts;
+        num_v2p_writeouts += data->num_v2p_writeouts;
+        num_phys_markers += data->num_phys_markers;
         dr_mutex_unlock(mutex);
         dr_raw_mem_free(data->buf_base, max_buf_size);
         if (data->reserve_buf != NULL)
             dr_raw_mem_free(data->reserve_buf, max_buf_size);
     }
+    data->~per_thread_t();
     dr_thread_free(drcontext, data, sizeof(per_thread_t));
 }
 
@@ -2778,8 +2991,18 @@ event_exit(void)
            num_refs);
     NOTIFY(1,
            "drmemtrace exiting process " PIDFMT "; traced " UINT64_FORMAT_STRING
-           " references.\n",
-           dr_get_process_id(), num_refs);
+           " references in " UINT64_FORMAT_STRING " writeouts.\n",
+           dr_get_process_id(), num_refs, num_writeouts);
+    if (op_use_physical.get_value()) {
+        dr_log(NULL, DR_LOG_ALL, 1,
+               "drcachesim num physical address markers emitted: " UINT64_FORMAT_STRING
+               "\n",
+               num_phys_markers);
+        NOTIFY(1,
+               "drmemtrace emitted " UINT64_FORMAT_STRING
+               " physical address markers in " UINT64_FORMAT_STRING " writeouts.\n",
+               num_phys_markers, num_v2p_writeouts);
+    }
     /* we use placement new for better isolation */
     instru->~instru_t();
     dr_global_free(instru, MAX_INSTRU_SIZE);
@@ -2897,6 +3120,15 @@ init_offline_dir(void)
 static void
 fork_init(void *drcontext)
 {
+    if (op_offline.get_value()) {
+        /* XXX i#4660: droption references at fork init time use malloc.
+         * We do not fully support static link with fork at this time.
+         */
+        dr_allow_unsafe_static_behavior();
+#    ifdef DRMEMTRACE_STATIC
+        NOTIFY(0, "-offline across a fork is unsafe with statically linked clients\n");
+#    endif
+    }
     /* We use DR_FILE_CLOSE_ON_FORK, and we dumped outstanding data prior to the
      * fork syscall, so we just need to create a new subdir, new module log, and
      * a new initial thread file for offline, or register the new process for
@@ -2908,6 +3140,7 @@ fork_init(void *drcontext)
      */
     data->num_refs = 0;
     if (op_offline.get_value()) {
+        data->file = INVALID_FILE;
         if (!init_offline_dir()) {
             FATAL("Failed to create a subdir in %s\n", op_outdir.get_value().c_str());
         }
@@ -2945,9 +3178,15 @@ drmemtrace_client_main(client_id_t id, int argc, const char *argv[])
                (op_record_heap.get_value() || !op_record_function.get_value().empty())) {
         FATAL("Usage error: function recording is only supported for -offline\n");
     }
-    if (op_L0_filter.get_value() &&
-        ((!IS_POWER_OF_2(op_L0I_size.get_value()) && op_L0I_size.get_value() != 0) ||
-         (!IS_POWER_OF_2(op_L0D_size.get_value()) && op_L0D_size.get_value() != 0))) {
+
+    if (op_L0_filter_deprecated.get_value()) {
+        op_L0D_filter.set_value(true);
+        op_L0I_filter.set_value(true);
+    }
+    if ((op_L0I_filter.get_value() && !IS_POWER_OF_2(op_L0I_size.get_value()) &&
+         op_L0I_size.get_value() != 0) ||
+        (op_L0D_filter.get_value() && !IS_POWER_OF_2(op_L0D_size.get_value()) &&
+         op_L0D_size.get_value() != 0)) {
         FATAL("Usage error: L0I_size and L0D_size must be 0 or powers of 2.");
     }
     if (op_raw_compress.get_value() == "none"
@@ -2967,6 +3206,12 @@ drmemtrace_client_main(client_id_t id, int argc, const char *argv[])
         FATAL("Usage error: unknown -raw_compress type %s.",
               op_raw_compress.get_value().c_str());
     }
+    // We cannot elide addresses or ignore offsets when we need to translate
+    // all addresses during tracing or when instruction or data address entries
+    // are being filtered.
+    if (op_use_physical.get_value() || op_L0I_filter.get_value() ||
+        op_L0D_filter.get_value())
+        op_disable_optimizations.set_value(true);
 
     DR_ASSERT(std::atomic_is_lock_free(&reached_trace_after_instrs));
     DR_ASSERT(std::atomic_is_lock_free(&tracing_disabled));
@@ -2974,7 +3219,7 @@ drmemtrace_client_main(client_id_t id, int argc, const char *argv[])
 
     drreg_init_and_fill_vector(&scratch_reserve_vec, true);
 #ifdef X86
-    if (op_L0_filter.get_value()) {
+    if (op_L0I_filter.get_value() || op_L0D_filter.get_value()) {
         /* We need to preserve the flags so we need xax. */
         drreg_set_vector_entry(&scratch_reserve_vec, DR_REG_XAX, false);
     }
@@ -2989,12 +3234,8 @@ drmemtrace_client_main(client_id_t id, int argc, const char *argv[])
         DR_ASSERT(MAX_INSTRU_SIZE >= sizeof(offline_instru_t));
         placement = dr_global_alloc(MAX_INSTRU_SIZE);
         instru = new (placement) offline_instru_t(
-            insert_load_buf_ptr, op_L0_filter.get_value(), &scratch_reserve_vec,
+            insert_load_buf_ptr, op_L0I_filter.get_value(), &scratch_reserve_vec,
             file_ops_func.write_file, module_file, op_disable_optimizations.get_value());
-        if (op_use_physical.get_value()) {
-            /* TODO i#4014: Add support for this combination. */
-            FATAL("Usage error: -offline does not currently support -use_physical.");
-        }
     } else {
         void *placement;
         /* we use placement new for better isolation */
@@ -3002,7 +3243,7 @@ drmemtrace_client_main(client_id_t id, int argc, const char *argv[])
         placement = dr_global_alloc(MAX_INSTRU_SIZE);
         instru = new (placement)
             online_instru_t(insert_load_buf_ptr, insert_update_buf_ptr,
-                            op_L0_filter.get_value(), &scratch_reserve_vec);
+                            op_L0I_filter.get_value(), &scratch_reserve_vec);
         if (!ipc_pipe.set_name(op_ipc_name.get_value().c_str()))
             DR_ASSERT(false);
 #ifdef UNIX
@@ -3033,8 +3274,8 @@ drmemtrace_client_main(client_id_t id, int argc, const char *argv[])
         FATAL("Failed to initialized function tracing.\n");
     }
 
-    /* We need an extra for -L0_filter. */
-    if (op_L0_filter.get_value())
+    /* We need an extra for -L0I_filter and -L0D_filter. */
+    if (op_L0I_filter.get_value() || op_L0D_filter.get_value())
         ++ops.num_spill_slots;
     // We use the buf pointer reg plus 2 more in instrument_clean_call, so we want
     // 3 total: thus 1 more than the base.
@@ -3056,8 +3297,13 @@ drmemtrace_client_main(client_id_t id, int argc, const char *argv[])
 #ifdef UNIX
     dr_register_fork_init_event(fork_init);
 #endif
+    /* We need our thread exit event to run *before* drmodtrack's as we may
+     * need to translate physical addresses for the thread's final buffer.
+     */
+    drmgr_priority_t pri_thread_exit = { sizeof(drmgr_priority_t), "", nullptr, nullptr,
+                                         -100 };
     if (!drmgr_register_thread_init_event(event_thread_init) ||
-        !drmgr_register_thread_exit_event(event_thread_exit))
+        !drmgr_register_thread_exit_event_ex(event_thread_exit, &pri_thread_exit))
         DR_ASSERT(false);
 
     instrumentation_init();
@@ -3102,19 +3348,6 @@ drmemtrace_client_main(client_id_t id, int argc, const char *argv[])
     /* make it easy to tell, by looking at log file, which client executed */
     dr_log(NULL, DR_LOG_ALL, 1, "drcachesim client initializing\n");
 
-    if (op_use_physical.get_value()) {
-        have_phys = physaddr.init();
-        if (!have_phys)
-            NOTIFY(0, "Unable to open pagemap: using virtual addresses.\n");
-        /* Unfortunately the use of std::unordered_map in physaddr_t calls malloc
-         * and thus we cannot support it for static linking, so we override the
-         * DR_DISALLOW_UNSAFE_STATIC declaration.
-         */
-        dr_allow_unsafe_static_behavior();
-#ifdef DRMEMTRACE_STATIC
-        NOTIFY(0, "-use_physical is unsafe with statically linked clients\n");
-#endif
-    }
 #ifdef HAS_SNAPPY
     if (op_offline.get_value() && snappy_enabled()) {
         /* Unfortunately libsnappy allocates memory but does not parameterize its
@@ -3142,6 +3375,9 @@ drmemtrace_client_main(client_id_t id, int argc, const char *argv[])
         /* We need the same is-buffer-zero checks in the instrumentation. */
         thread_filtering_enabled = true;
     }
+
+    if (op_use_physical.get_value() && !physaddr_t::global_init())
+        FATAL("Unable to open pagemap for physical addresses: check privileges.\n");
 }
 
 /* To support statically linked multiple clients, we add drmemtrace_client_main

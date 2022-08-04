@@ -126,6 +126,11 @@ add_exported_library(directory_iterator STATIC common/directory_iterator.cpp)
 add_dependencies(directory_iterator api_headers)
 target_link_libraries(directory_iterator drfrontendlib)
 
+# Right now drpt2trace only works on Linux x86_64.
+if (BUILD_PT_POST_PROCESSOR)
+  add_subdirectory(drpt2trace)
+endif (BUILD_PT_POST_PROCESSOR)
+
 set(raw2trace_srcs
   tracer/raw2trace.cpp
   tracer/raw2trace_directory.cpp
@@ -603,6 +608,14 @@ if (BUILD_TESTS)
     use_DynamoRIO_extension(tool.drcacheoff.view_test drdecode)
     add_test(NAME tool.drcacheoff.view_test
       COMMAND tool.drcacheoff.view_test)
+
+    add_executable(tool.drcachesim.histogram_test
+      tools/histogram.cpp tests/histogram_test.cpp)
+    target_link_libraries(tool.drcachesim.histogram_test
+      drmemtrace_static drmemtrace_analyzer)
+    add_win32_flags(tool.drcachesim.histogram_test)
+    add_test(NAME tool.drcachesim.histogram_test
+             COMMAND tool.drcachesim.histogram_test)
 
     add_executable(tool.drcacheoff.burst_static tests/burst_static.cpp)
     configure_DynamoRIO_static(tool.drcacheoff.burst_static)
