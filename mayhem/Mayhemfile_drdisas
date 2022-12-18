@@ -1,0 +1,5 @@
+project: dynamorio
+target: drdisas
+
+cmds:
+  - cmd: /repo/build/clients/bin64/drdisas

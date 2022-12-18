@@ -59,7 +59,8 @@ jobs:
       fail-fast: false
       matrix:
         mayhemfile:
-          - mayhem/Mayhemfile
+          - mayhem/Mayhemfile_hashtable_num_bits
+          - mayhem/Mayhemfile_drdisas
 
     steps:
       - uses: actions/checkout@v3
