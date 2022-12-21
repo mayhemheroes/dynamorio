@@ -1,0 +1,6 @@
+project: dynamorio
+target: hashtable-num-bits
+
+cmds:
+  - cmd: /fuzz_hashtable_num_bits
+    libfuzzer: true
